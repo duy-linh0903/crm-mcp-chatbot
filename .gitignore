@@ -17,3 +17,7 @@ out/
 # .NET Core build folders
 [Bb]in/
 [Oo]bj/
+
+# Local application settings
+appsettings.json
+appsettings.Development.json
