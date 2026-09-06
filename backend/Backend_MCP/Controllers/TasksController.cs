@@ -38,8 +38,10 @@ public class TasksController : ControllerBase
     }
 
     [HttpPost]
+    [Authorize(Roles = "Admin")]
     public async Task<ActionResult<TaskItemResponse>> Create([FromBody] CreateTaskRequest request, CancellationToken cancellationToken)
     {
+        request.CreatorId = User.FindFirstValue(ClaimTypes.NameIdentifier);
         var task = await _taskService.CreateAsync(request, cancellationToken);
         return Ok(task);
     }

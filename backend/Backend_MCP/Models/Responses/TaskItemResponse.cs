@@ -14,6 +14,8 @@ public class TaskItemResponse
 
     public string DepartmentId { get; set; } = string.Empty;
 
+    public string? CreatorId { get; set; }
+
     public string? AssigneeId { get; set; }
 
     public List<string> SupervisorIds { get; set; } = [];
@@ -34,6 +36,7 @@ public class TaskItemResponse
             Status = entity.Status.ToString(),
             Priority = entity.Priority.ToString(),
             DepartmentId = entity.DepartmentId,
+            CreatorId = entity.CreatorId,
             AssigneeId = entity.AssigneeId,
             SupervisorIds = entity.SupervisorIds,
             DueDate = entity.DueDate,
