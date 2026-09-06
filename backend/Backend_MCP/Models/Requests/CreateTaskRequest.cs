@@ -8,6 +8,8 @@ public class CreateTaskRequest
 
     public string DepartmentId { get; set; } = string.Empty;
 
+    public string? CreatorId { get; set; }
+
     public string? AssigneeId { get; set; }
 
     public List<string> SupervisorIds { get; set; } = [];

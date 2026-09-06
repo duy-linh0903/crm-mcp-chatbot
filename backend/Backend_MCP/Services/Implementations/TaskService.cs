@@ -4,11 +4,13 @@ public class TaskService : ITaskService
 {
     private readonly ITaskRepository _taskRepository;
     private readonly IUserRepository _userRepository;
+    private readonly IHubContext<NotificationHub> _hubContext;
 
-    public TaskService(ITaskRepository taskRepository, IUserRepository userRepository)
+    public TaskService(ITaskRepository taskRepository, IUserRepository userRepository, IHubContext<NotificationHub> hubContext)
     {
         _taskRepository = taskRepository;
         _userRepository = userRepository;
+        _hubContext = hubContext;
     }
 
     public async Task<List<TaskItemResponse>> GetAllAsync(CancellationToken cancellationToken = default)
@@ -42,6 +44,7 @@ public class TaskService : ITaskService
             Title = request.Title,
             Description = request.Description,
             DepartmentId = request.DepartmentId,
+            CreatorId = request.CreatorId,
             AssigneeId = request.AssigneeId,
             SupervisorIds = request.SupervisorIds,
             DueDate = request.DueDate,
@@ -51,6 +54,14 @@ public class TaskService : ITaskService
         };
 
         await _taskRepository.CreateAsync(task, cancellationToken);
+        if (!string.IsNullOrWhiteSpace(task.AssigneeId))
+        {
+            await _hubContext.Clients.User(task.AssigneeId).SendAsync("ReceiveAlert", new
+            {
+                type = "TaskCreated",
+                task = TaskItemResponse.FromEntity(task)
+            }, cancellationToken);
+        }
         return TaskItemResponse.FromEntity(task);
     }
 
@@ -88,6 +99,21 @@ public class TaskService : ITaskService
         task.CompletedAt = status == TaskStatus.Completed ? DateTime.UtcNow : null;
 
         await _taskRepository.ReplaceAsync(task, cancellationToken);
+        var recipientIds = task.SupervisorIds
+            .Append(task.CreatorId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id!)
+            .Distinct()
+            .ToList();
+
+        if (recipientIds.Count > 0)
+        {
+            await _hubContext.Clients.Users(recipientIds).SendAsync("ReceiveAlert", new
+            {
+                type = "TaskStatusUpdated",
+                task = TaskItemResponse.FromEntity(task)
+            }, cancellationToken);
+        }
         return TaskItemResponse.FromEntity(task);
     }
 

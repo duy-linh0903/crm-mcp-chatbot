@@ -6,17 +6,24 @@ public class AiChatService : IAiChatService
     private readonly IChatService _chatService;
     private readonly HttpClient _httpClient;
     private readonly IConfiguration _configuration;
+    private readonly IMemoryCache _memoryCache;
+    private readonly string[] _apiKeys;
+    private int _nextApiKeyIndex;
 
     public AiChatService(
         IMcpToolService mcpToolService,
         IChatService chatService,
         HttpClient httpClient,
-        IConfiguration configuration)
+        IConfiguration configuration,
+        IMemoryCache memoryCache)
     {
         _mcpToolService = mcpToolService;
         _chatService = chatService;
         _httpClient = httpClient;
         _configuration = configuration;
+        _memoryCache = memoryCache;
+        _apiKeys = configuration.GetSection("Gemini:ApiKey").Get<string[]>() ??
+            [configuration["Gemini:ApiKey"] ?? string.Empty];
     }
 
     public async Task<ChatResponse> AskAsync(AskAiRequest request, CancellationToken cancellationToken = default)
@@ -25,9 +32,6 @@ public class AiChatService : IAiChatService
         {
             throw new ArgumentNullException(nameof(request));
         }
-
-        var apiKey = _configuration["Gemini:ApiKey"] ?? string.Empty;
-        var apiUrl = $"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={apiKey}";
 
         var session = await _chatService.EnsureSessionAsync(request.UserId, request.SessionId, request.SessionTitle, cancellationToken);
         await _chatService.SaveUserMessageAsync(request.UserId, session.SessionId, request.Message, cancellationToken);
@@ -74,7 +78,7 @@ public class AiChatService : IAiChatService
                 tools = toolsDeclaration
             };
 
-            var response = await SendToGeminiAsync(apiUrl, requestBody, cancellationToken);
+            var response = await SendToGeminiWithKeyFallbackAsync(requestBody, cancellationToken);
             var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
 
             using var doc = JsonDocument.Parse(responseJson);
@@ -105,7 +109,11 @@ public class AiChatService : IAiChatService
                         Parameters = args
                     };
 
-                    var mcpResponse = await _mcpToolService.HandleAsync(mcpRequest, cancellationToken);
+                    var mcpResponse = await HandleToolWithCacheAsync(functionName, args, mcpRequest, cancellationToken);
+                    if (functionName.Equals("get_task_chat_history", StringComparison.OrdinalIgnoreCase))
+                    {
+                        mcpResponse.Result = TruncateChatHistory(mcpResponse.Result, 20);
+                    }
                     toolCallLogs.Add(new McpToolCallLog
                     {
                         ToolName = functionName,
@@ -169,10 +177,77 @@ public class AiChatService : IAiChatService
         return fallbackPayload;
     }
 
-    private Task<HttpResponseMessage> SendToGeminiAsync(string url, object body, CancellationToken cancellationToken)
+    private async Task<JsonRpcResponse> HandleToolWithCacheAsync(
+        string functionName,
+        JsonElement args,
+        JsonRpcRequest mcpRequest,
+        CancellationToken cancellationToken)
     {
-        var jsonContent = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-        return _httpClient.PostAsync(url, jsonContent, cancellationToken);
+        var isStatisticsTool = functionName is "get_department_kpi" or "get_overdue_tasks" or "get_workload_summary";
+        if (!isStatisticsTool)
+        {
+            return await _mcpToolService.HandleAsync(mcpRequest, cancellationToken);
+        }
+
+        var cacheKey = $"mcp:{functionName}:{args.GetRawText()}";
+        if (_memoryCache.TryGetValue<JsonRpcResponse>(cacheKey, out var cachedResponse) && cachedResponse is not null)
+        {
+            return cachedResponse;
+        }
+
+        var response = await _mcpToolService.HandleAsync(mcpRequest, cancellationToken);
+        _memoryCache.Set(cacheKey, response, TimeSpan.FromMinutes(5));
+        return response;
+    }
+
+    private async Task<HttpResponseMessage> SendToGeminiWithKeyFallbackAsync(object body, CancellationToken cancellationToken)
+    {
+        var availableKeys = _apiKeys.Where(key => !string.IsNullOrWhiteSpace(key)).ToArray();
+        if (availableKeys.Length == 0)
+        {
+            throw new InvalidOperationException("Gemini:ApiKey chưa được cấu hình.");
+        }
+
+        var startIndex = Math.Abs(Interlocked.Increment(ref _nextApiKeyIndex)) % availableKeys.Length;
+        HttpResponseMessage? lastResponse = null;
+        for (var attempt = 0; attempt < availableKeys.Length; attempt++)
+        {
+            var apiKey = availableKeys[(startIndex + attempt) % availableKeys.Length];
+            var apiUrl = $"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={apiKey}";
+            try
+            {
+                var jsonContent = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+                var response = await _httpClient.PostAsync(apiUrl, jsonContent, cancellationToken);
+                var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+                var isQuotaError = response.StatusCode == System.Net.HttpStatusCode.TooManyRequests ||
+                    responseBody.Contains("quota", StringComparison.OrdinalIgnoreCase) ||
+                    responseBody.Contains("resource exhausted", StringComparison.OrdinalIgnoreCase);
+
+                if (!isQuotaError || attempt == availableKeys.Length - 1)
+                {
+                    return response;
+                }
+
+                lastResponse = response;
+                response.Dispose();
+            }
+            catch (HttpRequestException) when (attempt < availableKeys.Length - 1)
+            {
+                continue;
+            }
+        }
+
+        return lastResponse ?? throw new InvalidOperationException("Không thể gọi Gemini với các API key hiện có.");
+    }
+
+    private static JsonElement? TruncateChatHistory(JsonElement? result, int maxMessages)
+    {
+        if (result is not { ValueKind: JsonValueKind.Array } history)
+        {
+            return result;
+        }
+
+        return JsonSerializer.SerializeToElement(history.EnumerateArray().TakeLast(maxMessages).ToList());
     }
 
     private static string ExtractTextFromGeminiResponse(JsonElement root)
